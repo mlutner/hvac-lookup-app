@@ -1,0 +1,441 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector]
+}
+
+// NextAuth required tables
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// User model with role and tier
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String?
+  emailVerified DateTime?
+  image         String?
+  passwordHash  String?
+  role          String   @default("FREE")
+  tier          String   @default("FREE")
+  orgId         String?
+  hidePromos    Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  org         Organization? @relation(fields: [orgId], references: [id])
+  accounts    Account[]
+  sessions    Session[]
+  feedback    Feedback[]
+  ocrJobs     OCRJob[]
+  auditLogs   AuditLog[]
+}
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users User[]
+}
+
+// ============================================================================
+// PRODUCT HIERARCHY (Manufacturer → Brand → ProductLine → Model)
+// ============================================================================
+
+// Manufacturer (top-level corporate entity)
+model Manufacturer {
+  id        String   @id @default(cuid())
+  name      String   @unique // "Carrier Global", "Trane Technologies"
+  website   String?
+  createdAt DateTime @default(now())
+
+  brands Brand[]
+}
+
+// Brand (consumer-facing brand name)
+model Brand {
+  id             String   @id @default(cuid())
+  name           String   @unique // "Carrier", "Bryant", "Trane"
+  slug           String   @unique
+  manufacturerId String?
+  aliases        String   @default("[]") // JSON array as string
+  parentCompany  String? // Legacy - use manufacturer relation instead
+  description    String?
+  logoUrl        String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  manufacturer   Manufacturer?     @relation(fields: [manufacturerId], references: [id])
+  ruleSets       RuleSet[]
+  productLines   ProductLine[]
+  serialPatterns SerialPattern[]
+  brandDocuments BrandDocument[]
+}
+
+// Product Category (hierarchical - Furnaces, Heat Pumps, etc.)
+model ProductCategory {
+  id        String   @id @default(cuid())
+  name      String   // "Furnaces", "Heat Pumps", "Air Conditioners"
+  slug      String   @unique
+  parentId  String?
+  path      String   // Materialized path: "/HVAC/Heating/Furnaces"
+  level     Int      @default(0)
+  createdAt DateTime @default(now())
+
+  parent       ProductCategory?  @relation("CategoryHierarchy", fields: [parentId], references: [id])
+  children     ProductCategory[] @relation("CategoryHierarchy")
+  productLines ProductLine[]
+}
+
+// Product Line / Series (e.g., "59MN7 Series")
+model ProductLine {
+  id              String   @id @default(cuid())
+  name            String   // "59MN7 Series", "XR15 Series"
+  brandId         String
+  categoryId      String?
+  description     String?
+  productionStart Int? // Year started
+  productionEnd   Int? // Year ended (null if current)
+  createdAt       DateTime @default(now())
+
+  brand            Brand                  @relation(fields: [brandId], references: [id])
+  category         ProductCategory?       @relation(fields: [categoryId], references: [id])
+  models           Model[]
+  serialPatterns   SerialPattern[]
+  productLineDocuments ProductLineDocument[]
+
+  @@unique([brandId, name])
+}
+
+// Individual Model (specific model number)
+model Model {
+  id              String   @id @default(cuid())
+  modelNumber     String   // "59MN7A100", "XR15-024-230"
+  productLineId   String
+  name            String?  // Friendly name
+  specs           String   @default("{}") // JSON: BTU, SEER, AFUE, dimensions
+  productionStart Int?
+  productionEnd   Int?
+  createdAt       DateTime @default(now())
+
+  productLine    ProductLine     @relation(fields: [productLineId], references: [id])
+  modelDocuments ModelDocument[]
+
+  @@unique([productLineId, modelNumber])
+}
+
+// ============================================================================
+// DOCUMENT SYSTEM (Links to Paperless-ngx)
+// ============================================================================
+
+// Document Type (controlled vocabulary)
+model DocumentType {
+  id          String   @id @default(cuid())
+  code        String   @unique // DECODE_GUIDE, SERVICE_MANUAL, etc.
+  name        String   // "Serial Decode Guide"
+  description String?
+  priority    Int      @default(0) // For search ranking
+
+  documents Document[]
+}
+
+// Document metadata (mirrors Paperless documents)
+model Document {
+  id             String   @id @default(cuid())
+  paperlessDocId String   @unique // Links to Paperless-ngx document ID
+  title          String
+  typeId         String?
+  isOfficial     Boolean  @default(false) // From manufacturer?
+  reliability    Float    @default(0.8)   // 0-1 confidence score
+  language       String   @default("en")
+  pageCount      Int?
+  isEmbedded     Boolean  @default(false) // Has been processed for embeddings?
+  embeddedAt     DateTime? // When embeddings were generated
+  createdAt      DateTime @default(now())
+
+  type               DocumentType?         @relation(fields: [typeId], references: [id])
+  brandDocuments     BrandDocument[]
+  productLineDocuments ProductLineDocument[]
+  modelDocuments     ModelDocument[]
+  citations          Citation[]
+  documentTags       DocumentTag[]
+  chunks             DocumentChunk[]
+}
+
+// Document Chunk - for vector embeddings (RAG)
+// Note: The 'embedding' column is created via raw SQL as pgvector type
+// Prisma doesn't natively support vector type, so we use Unsupported
+model DocumentChunk {
+  id           String   @id @default(cuid())
+  documentId   String
+  chunkIndex   Int      // Order within document
+  pageNumber   Int?     // Page this chunk is from
+  content      String   // The actual text content
+  tokenCount   Int      // Number of tokens in chunk
+  // embedding field added via migration SQL: vector(1536) for OpenAI embeddings
+  embeddingModel String  @default("text-embedding-3-small")
+  createdAt    DateTime @default(now())
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, chunkIndex])
+  @@index([documentId])
+}
+
+// Junction: Brand ↔ Document
+model BrandDocument {
+  brandId    String
+  documentId String
+  relevance  Int    @default(5) // 1-10 scale
+
+  brand    Brand    @relation(fields: [brandId], references: [id])
+  document Document @relation(fields: [documentId], references: [id])
+
+  @@id([brandId, documentId])
+}
+
+// Junction: ProductLine ↔ Document
+model ProductLineDocument {
+  productLineId String
+  documentId    String
+  relevance     Int    @default(5)
+
+  productLine ProductLine @relation(fields: [productLineId], references: [id])
+  document    Document    @relation(fields: [documentId], references: [id])
+
+  @@id([productLineId, documentId])
+}
+
+// Junction: Model ↔ Document
+model ModelDocument {
+  modelId    String
+  documentId String
+  isPrimary  Boolean @default(false)
+  relevance  Int     @default(5)
+
+  model    Model    @relation(fields: [modelId], references: [id])
+  document Document @relation(fields: [documentId], references: [id])
+
+  @@id([modelId, documentId])
+}
+
+// Tagging System
+model Tag {
+  id       String  @id @default(cuid())
+  name     String  @unique
+  category String? // "equipment_type", "fuel_type", "feature"
+
+  documentTags DocumentTag[]
+}
+
+model DocumentTag {
+  documentId String
+  tagId      String
+
+  document Document @relation(fields: [documentId], references: [id])
+  tag      Tag      @relation(fields: [tagId], references: [id])
+
+  @@id([documentId, tagId])
+}
+
+// ============================================================================
+// SERIAL DECODE ENGINE (Database-driven rules)
+// ============================================================================
+
+// Serial Pattern (database-driven decode rules)
+model SerialPattern {
+  id            String   @id @default(cuid())
+  name          String   // "Carrier 2004+ Format"
+  brandId       String?  // Can apply to brand level
+  productLineId String?  // Or specific product line
+  regex         String
+  decodeRules   String   // JSON: position-based instructions
+  confidence    Float    @default(0.9)
+  validFrom     Int?     // Year pattern started
+  validTo       Int?     // Year pattern ended (null if current)
+  priority      Int      @default(0) // Higher = check first
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+
+  brand       Brand?           @relation(fields: [brandId], references: [id])
+  productLine ProductLine?     @relation(fields: [productLineId], references: [id])
+  citations   Citation[]
+  examples    PatternExample[]
+}
+
+// Citation linking patterns to source documents
+model Citation {
+  id         String @id @default(cuid())
+  patternId  String
+  documentId String
+  pageStart  Int
+  pageEnd    Int
+  excerpt    String
+
+  pattern  SerialPattern @relation(fields: [patternId], references: [id])
+  document Document      @relation(fields: [documentId], references: [id])
+}
+
+// Test examples for patterns
+model PatternExample {
+  id           String   @id @default(cuid())
+  patternId    String
+  serial       String
+  expectedYear Int
+  expectedMonth Int?
+  expectedWeek Int?
+  notes        String?
+  isVerified   Boolean  @default(false)
+  createdAt    DateTime @default(now())
+
+  pattern SerialPattern @relation(fields: [patternId], references: [id])
+}
+
+// ============================================================================
+// LEGACY RULE ENGINE (Preserved for backward compatibility)
+// ============================================================================
+
+model RuleSet {
+  id            String    @id @default(cuid())
+  brandId       String
+  version       Int       @default(1)
+  effectiveFrom DateTime  @default(now())
+  effectiveTo   DateTime?
+  status        String    @default("ACTIVE")
+  notes         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  brand Brand  @relation(fields: [brandId], references: [id])
+  rules Rule[]
+
+  @@unique([brandId, version])
+}
+
+model Rule {
+  id                String   @id @default(cuid())
+  ruleSetId         String
+  name              String
+  description       String?
+  regex             String
+  decodeJson        String   // JSON string
+  confidenceDefault Float    @default(0.9)
+  priority          Int      @default(0)
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  ruleSet  RuleSet       @relation(fields: [ruleSetId], references: [id])
+  examples RuleExample[]
+  sources  Source[]
+}
+
+model RuleExample {
+  id           String   @id @default(cuid())
+  ruleId       String
+  serial       String
+  expectedDate String
+  notes        String?
+  isVerified   Boolean  @default(false)
+  createdAt    DateTime @default(now())
+
+  rule Rule @relation(fields: [ruleId], references: [id])
+}
+
+model Source {
+  id             String   @id @default(cuid())
+  ruleId         String
+  paperlessDocId String
+  pageStart      Int
+  pageEnd        Int
+  excerpt        String
+  createdAt      DateTime @default(now())
+
+  rule Rule @relation(fields: [ruleId], references: [id])
+}
+
+model Feedback {
+  id          String   @id @default(cuid())
+  type        String
+  status      String   @default("PENDING")
+  payloadJson String
+  createdById String
+  notes       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  createdBy User @relation(fields: [createdById], references: [id])
+}
+
+model OCRJob {
+  id              String   @id @default(cuid())
+  userId          String
+  imageUrl        String
+  extractedText   String?
+  extractedSerial String?
+  extractedModel  String?
+  confidence      Float?
+  status          String   @default("PENDING")
+  errorMessage    String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  action     String
+  entityType String
+  entityId   String
+  oldValue   String?
+  newValue   String?
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
