@@ -9,8 +9,8 @@ This document tracks all changes, migrations, and updates to the HVAC Lookup Por
 
 ### Completed
 - [x] Set up Paperless-ngx backend with Docker (PostgreSQL, Redis, webserver)
-- [x] Created admin user: `admin` / `admin123`
-- [x] Generated API token: `e166905f4c079900c74b9dadb949a906cd69d158`
+- [x] Created admin user (credentials omitted; keep them in the approved secret store).
+- [x] Generated API token (value omitted; keep it in the approved secret store).
 - [x] Fixed Docker Desktop Rosetta installation issue
 - [x] Fixed Next.js middleware cache corruption
 - [x] Fixed dashboard TypeScript error (Link href undefined)
